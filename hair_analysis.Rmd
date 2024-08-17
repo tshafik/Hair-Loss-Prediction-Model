@@ -1,0 +1,544 @@
+---
+title: "Project STA 141C"
+output: html_document
+date: "2024-02-13"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(ggplot2)
+library(dplyr)
+library(gridExtra)
+library(glmnet)
+library(caret)
+library(MASS)
+library(randomForest)
+library(rpart)
+
+```
+
+## Data Processing
+```{r}
+
+#Reading CSV File
+hair = read.csv("hair.csv")
+
+#Check if any data is missing basic statistics of the structure on data set
+any(is.na(hair))
+head(hair)
+summary(hair)
+str(hair)
+
+#Remove ID because there is no need 
+hair = hair[-1]
+
+#Simplifying analysis process by categorizing the types of variables there are
+binary_var = c('Genetics','Hormonal.Changes','Poor.Hair.Care.Habits','Environmental.Factors','Smoking','Weight.Loss')
+categorical_var = c('Medical.Conditions','Medications...Treatments','Nutritional.Deficiencies')
+ordinal_var = 'Stress'
+continuous_var = 'Age'
+
+```
+
+```{r}
+df = hair
+# Assuming 'df' is your dataframe and 'categorical_var' is a vector of categorical variable names
+index = 1
+for (i in 1:2) {
+  par(mfrow=c(1, 4), mar=c(2, 2, 2, 2)) # Setup plot layout
+  for (j in 1:4) {
+    if (index <= length(categorical_var)) {
+      counts = table(df[[categorical_var[index]]])
+      pie(counts, labels=names(counts), main=categorical_var[index])
+
+      index = index + 1
+    }
+  }
+}
+# For bar plots
+par(mfrow=c(1, 3), mar=c(2, 2, 2, 2)) # Adjust layout for three plots
+for (i in c(3, 4, 5)) {
+  if (i <= length(categorical_var)) {
+    counts = table(df[[categorical_var[i]]])
+    barplot(counts, main=categorical_var[i], las=2) # las=2 for vertical axis labels
+    # Adding labels on top of bars
+    text(x=1:length(counts), y=counts, labels=counts, pos=3, cex=0.8)
+  }
+}
+
+#Plotting Medical Conditions
+ggplot(df, aes(x = Age, fill = Medical.Conditions)) +
+  geom_density(alpha = 0.5) +
+  labs(title = "Density Plot for Age against Medical Conditions", x = "Age", y = "Density") +
+  theme_minimal()
+
+
+ggplot(df, aes(x = Age, fill = Medical.Conditions)) +
+  geom_density(alpha = 0.5) +
+  labs(title = "Density Plot for Age against Medical Conditions", x = "Age", y = "Density") +
+  facet_wrap(~Medical.Conditions, scales = 'free_y') +
+  theme_minimal()
+
+```
+
+
+
+
+
+
+
+
+
+
+## Testing and Training Data
+
+```{r}
+set.seed(1985)
+
+# Creating a Data Partition for Testing and Training
+index = createDataPartition(hair$Hair.Loss, p=.8, list=FALSE, times=1)
+
+
+# Training and Testing Data
+hair_train = hair[index,]
+hair_test = hair[-index,]
+
+#Confirming Row Count
+nrow(hair_test)
+nrow(hair_train)
+
+```
+
+
+## Logistic Regression
+
+### AIC criterion to find best model, with forward stepwise
+```{r}
+# Fit the initial model with only the most significant predictor
+initial_model <- glm(Hair.Loss ~ Age, data = hair_train, family = binomial)
+
+# Perform forward stepwise selection using stepAIC
+step_model <- stepAIC(initial_model, scope = list(lower = initial_model, upper = ~ Genetics + Hormonal.Changes + Medical.Conditions + Medications...Treatments + Nutritional.Deficiencies + Stress + Age + Poor.Hair.Care.Habits + Environmental.Factors + Smoking + Weight.Loss), direction = "forward")
+
+# Display the final model
+summary(step_model)
+```  
+
+
+
+## Cross Validation, K folds = 10
+### Creating log loss estimation function with cross validation
+```{r}
+
+
+#Making a log loss function with cross validation k folds
+log_loss_estimate = function(data,formula){
+  
+  # Set up 'trainControl' to save class probabilities without 'twoClassSummary'
+  ctrlspecs <- trainControl(method = "cv",
+                            number = 10,
+                            savePredictions = "final",
+                            classProbs = TRUE)  # Removed 'summaryFunction'
+  
+  # Train the logistic model with the updated 'trainControl'
+  logistic_model <- train(formula, data=data, 
+                          method="glm", 
+                          family="binomial", 
+                          trControl=ctrlspecs)
+  actual <- logistic_model$pred$obs
+  predicted <- logistic_model$pred$Yes  
+  
+  # Calculate log loss using the saved predictions
+  log_loss <- -mean(ifelse(actual == "Yes", 1, 0) * log(predicted) + 
+                    ifelse(actual == "No", 1, 0) * log(1 - predicted))
+  return(log_loss)
+}
+```
+
+
+### Forward stepwise selection with log loss function
+```{r}
+#Relabeling Outcome of Hair Loss
+hair_train$Hair.Loss[hair_train$Hair.Loss == 1] = 'Yes'
+hair_train$Hair.Loss[hair_train$Hair.Loss == 0] = 'No'
+
+hair_test$Hair.Loss[hair_test$Hair.Loss == 1] = 'Yes'
+hair_test$Hair.Loss[hair_test$Hair.Loss == 0] = 'No'
+
+
+# Convert the outcome to a factor with two levels
+hair_train$Hair.Loss <- factor(hair_train$Hair.Loss, levels = c("No", "Yes"))
+
+# Start with the intercept only model
+min_loss <- Inf
+best_model <- NULL
+selected_predictors <- c()
+
+# All possible predictors
+all_predictors <- setdiff(colnames(hair_train), "Hair.Loss")
+
+while (length(all_predictors) > 0) {
+    losses <- numeric(length(all_predictors))
+
+    for (i in seq_along(all_predictors)) {
+        current_predictors <- c(selected_predictors, all_predictors[i])
+        mformula <- as.formula(paste("Hair.Loss ~", paste(current_predictors, collapse=" + ")))
+        losses[i] <- log_loss_estimate(hair_train, formula = mformula)
+    }
+
+    # Find the predictor that minimizes the loss
+    min_loss_index <- which.min(losses)
+    if (losses[min_loss_index] < min_loss) {
+        min_loss <- losses[min_loss_index]
+        best_predictor <- all_predictors[min_loss_index]
+        selected_predictors <- c(selected_predictors, best_predictor)
+        best_model <- paste("Hair.Loss ~", paste(selected_predictors, collapse=" + "))
+        
+        # Remove the selected predictor from the pool
+        all_predictors <- all_predictors[!all_predictors %in% best_predictor]
+        
+        print(paste("Added", best_predictor, "with log loss", min_loss))
+    } else {
+        break  # Exit the loop if no improvement
+    }
+}
+
+print(paste("Best model:", best_model))
+
+```
+
+
+
+
+### Model with smallest log loss was smoking age and genetics
+```{r}
+logistic_model = train(Hair.Loss ~ Smoking +  Age + Genetics, data = hair_train,method = 'glm', family = 'binomial')
+summary(logistic_model)
+logit_pred = predict(logistic_model,hair_test )
+logit_pred
+table(logit_pred,hair_test$Hair.Loss)
+mean(logit_pred == hair_test$Hair.Loss)
+
+
+predictions = predict(logistic_model, newdata = hair_test)
+hair_test$Hair.Loss = factor(hair_test$Hair.Loss, levels = levels(predictions))
+
+cf_matrix = confusionMatrix(predictions, hair_test$Hair.Loss)
+cf_matrix$overall["Accuracy"]
+
+conf_mat_matrix <- as.matrix(cf_matrix$table)
+conf_mat_df <- as.data.frame(as.table(conf_mat_matrix))
+names(conf_mat_df) <- c("Reference", "Prediction", "Frequency")
+ggplot(conf_mat_df, aes(x = Reference, y = Prediction, fill = Frequency)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = sprintf("%1.0f", Frequency)), vjust = 1) +
+  scale_fill_gradient(low = "white", high = "blue") +
+  theme_minimal() +
+  labs(title = "Confusion Matrix", x = "Actual Class", y = "Predicted Class")
+```
+
+
+
+
+# LDA
+```{r}
+hair_train
+model = lda(Hair.Loss ~ ., data = hair_train)
+
+
+coefficients = coef(model)
+
+# Calculate importance scores (absolute values of coefficients)
+importance_scores = abs(coefficients)
+
+
+# Calculate MSE_train
+predictions_train = predict(model, newdata = hair_train)$class
+MSE_train = mean((
+  as.integer(predictions_train) - as.integer(hair_train$Hair.Loss)
+) ^ 2)
+MSE_train
+
+
+predictions = predict(model, newdata = hair_test)$class
+hair_test$Hair.Loss = factor(hair_test$Hair.Loss, levels = levels(predictions))
+
+cf_matrix = confusionMatrix(predictions, hair_test$Hair.Loss)
+cf_matrix$overall["Accuracy"]
+
+conf_mat_matrix <- as.matrix(cf_matrix$table)
+conf_mat_df <- as.data.frame(as.table(conf_mat_matrix))
+names(conf_mat_df) <- c("Reference", "Prediction", "Frequency")
+ggplot(conf_mat_df, aes(x = Reference, y = Prediction, fill = Frequency)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = sprintf("%1.0f", Frequency)), vjust = 1) +
+  scale_fill_gradient(low = "white", high = "blue") +
+  theme_minimal() +
+  labs(title = "Confusion Matrix", x = "Actual Class", y = "Predicted Class")
+
+```
+
+
+## QDA
+```{r}
+hair_train_qda = hair_train
+hair_test_qda = hair_test
+
+# Convert binary columns to numeric
+binary_columns <-
+  c(
+    "Genetics",
+    "Hormonal.Changes",
+    "Poor.Hair.Care.Habits",
+    "Environmental.Factors",
+    "Smoking",
+    "Weight.Loss"
+  )
+
+#Apply the conversion on each specified column
+hair_train_qda[binary_columns] <-
+  lapply(hair_train_qda[binary_columns], function(x) {
+    # Trim leading/trailing whitespace and convert to lowercase before comparison
+    as.integer(trimws(tolower(x)) == "yes")
+  })
+
+# Convert other categorical variables to factors
+categorical_columns <-
+  c(
+    "Medical.Conditions",
+    "Medications...Treatments",
+    "Nutritional.Deficiencies",
+    "Stress"
+  )
+
+hair_train_qda[categorical_columns] <-
+  lapply(hair_train_qda[categorical_columns], factor)
+
+
+
+
+# Find near-zero variance predictors
+nzv <- nearZeroVar(hair_train_qda)
+
+#If there are near zero variance predictors then remove
+if (length(nzv) > 0) {
+  nzv <- nzv[nzv != which(colnames(hair_train_qda) == "Hair.Loss")]
+  hair_train_qda = hair_train_qda[,-nzv]
+  hair_test_qda = hair_test[,-nzv]
+}
+
+
+
+
+# Perform QDA
+qda_model <- qda(Hair.Loss ~ ., data = hair_train_qda)
+
+# Make predictions on the clean dataset
+predictions <- predict(qda_model, newdata = hair_test_qda)$class
+
+# Create a confusion matrix
+conf_mat <- confusionMatrix(as.factor(predictions), as.factor(hair_test_qda$Hair.Loss))
+
+# Plotting the confusion matrix with ggplot2
+conf_mat_df <- as.data.frame(as.table(conf_mat$table))
+names(conf_mat_df) <- c("Reference", "Prediction", "Frequency")
+
+ggplot(conf_mat_df, aes(x = Reference, y = Prediction, fill = Frequency)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Frequency), vjust = 1) +
+  scale_fill_gradient(low = "white", high = "blue") +
+  theme_minimal() +
+  labs(title = "Confusion Matrix", x = "Actual Class", y = "Predicted Class")
+
+
+
+
+mean(predictions  == hair_test_qda$Hair.Loss)
+```
+
+
+
+
+
+
+
+
+# Random Forest
+
+
+### Building Initial Mode 
+
+```{r}
+
+# Build the random forest model on the training data
+rf_model <- randomForest(Hair.Loss ~ ., data = hair_train)
+
+# Print the model summary
+print(rf_model)
+
+# Make predictions on the test data
+predictions <- predict(rf_model, newdata = hair_test)
+
+# Calculate the confusion matrix
+conf_matrix <- table(predictions, hair_test$Hair.Loss)
+
+# Calculate the classification error
+classification_error <- 1 - sum(diag(conf_matrix)) / sum(conf_matrix)
+
+# Print the confusion matrix and classification error
+print("Confusion Matrix:")
+print(conf_matrix)
+print(paste("Classification Error:", classification_error))
+
+```
+
+### Calculating first MSE 
+```{r}
+
+# Calculate the MSE
+mse <- mean((as.numeric(predictions) - as.numeric(hair_test$Hair.Loss))^2)
+print(paste("Mean Squared Error (MSE):", mse))
+
+```
+
+### Variable Importance Measure
+
+```{r}
+# Plot variable importance based on Gini index in ascending order
+bp <- barplot(var_importance[order, "MeanDecreaseGini"],
+        names.arg = rownames(var_importance)[order],
+        main = "Variable Importance (Gini Index)",
+        ylab = "Mean Decrease in Gini Index",
+        col = "steelblue", horiz = TRUE)  # Set the bar color to blue
+
+# Define a buffer value to adjust the space between the bars and text labels
+buffer <- max(var_importance[order, "MeanDecreaseGini"]) * 0.05  # 5% buffer from the max value
+
+# Add text outside the bars to the right
+# Use the midpoints 'bp' returned by barplot to position the labels correctly
+text(x = var_importance[order, "MeanDecreaseGini"] + buffer, 
+     y = bp,  # 'bp' contains the midpoints of the bars
+     labels = rownames(var_importance)[order], 
+     pos = 4, cex = 0.8, col = "black")  # Set pos to 4 for right, col for text color
+
+# Extract variable importance
+var_importance <- importance(rf_model)
+
+# Order variables by mean decrease in Gini index in ascending order
+order <- order(var_importance[, "MeanDecreaseGini"], decreasing = TRUE)
+
+# Create a dataframe with variable names and Mean Decrease in Gini Index scores
+var_importance_df <- data.frame(
+  Variable = rownames(var_importance)[order],
+  Gini_Index = var_importance[order, "MeanDecreaseGini"]
+)
+
+# Print the dataframe
+print(var_importance_df)
+
+
+```
+
+### Adding cross validation to the model 
+```{r}
+# Set a seed for reproducibility
+set.seed(123)
+
+# Define the control specifications for cross-validation
+ctrlspecs <- trainControl(
+  method = "cv",         # Use k-fold cross-validation
+  number = 10,            # Number of folds (you can adjust this as needed)
+  savePredictions = "all",
+  classProbs = TRUE
+)
+
+# Build the random forest model using cross-validation
+rf_model_cv <- train(
+  Hair.Loss ~ .,
+  data = hair_train,
+  method = "rf",
+  trControl = ctrlspecs
+)
+
+# Print the cross-validated model summary
+summary(rf_model_cv)
+```
+
+### MSE with cross validation
+```{r}
+
+# Calculate classification error
+classification_error <- 1 - rf_model_cv$results$Accuracy
+print(paste("Classification Error:", classification_error))
+
+
+# Make predictions on the test data subset using the cross-validated model
+cv_predictions <- predict(rf_model_cv, newdata = hair_test)
+
+# Calculate confusion matrix
+#cv_predictions <- factor(cv_predictions, levels = c("No", "Yes"), labels = c("0", "1"))
+
+conf_matrix_cv <- confusionMatrix(cv_predictions, hair_test$Hair.Loss)
+print("Confusion Matrix:")
+print(conf_matrix_cv)
+
+# Calculate Mean Squared Error (MSE)
+mse_cv <- mean(cv_predictions == hair_test$Hair.Loss)
+print(paste("Mean Squared Error (MSE):", mse_cv))
+
+cv_predictions
+
+
+```
+
+```{r}
+# Convert the confusion matrix to a data frame
+conf_matrix_df <- as.data.frame(conf_matrix_cv$table)
+
+# Load necessary libraries
+library(ggplot2)
+library(reshape2) # For melt function
+
+# Melt the data frame for plotting
+conf_matrix_melted <- melt(conf_matrix_df)
+
+# Plot the confusion matrix heatmap
+ggplot(data = conf_matrix_melted, aes(x = Reference, y = Prediction, fill = value)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = sprintf("%1.0f", value)), vjust = 1) +
+  scale_fill_gradient(low = "white", high = "blue") +
+  labs(title = "Confusion Matrix", x = "Actual Class", y = "Predicted Class") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+### Plotting the random forest model
+```{r}
+response_variable <- "Hair.Loss"
+
+# Build the decision tree model
+tree_model <- rpart(formula = as.formula(paste(response_variable, "~ .")), data = hair_train)
+
+
+# Plot the decision tree without uniform spacing
+plot(tree_model, main = "Decision Tree for Hair Loss")
+text(tree_model, use.n = FALSE, cex = 0.6, xpd = TRUE)
+```
+
+```{r}
+print(tree_model)
+
+# Assuming 'tree_model' is your decision tree model created with rpart
+# Assuming 'Medical.Conditions' is the categorical variable
+
+# Print the decision tree summary
+tree_summary <- summary(tree_model)
+
+
+```
+
+
+
+
